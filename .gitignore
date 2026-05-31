@@ -1,0 +1,53 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Anaconda / virtual env
+.env
+.venv/
+env/
+venv/
+
+# Database
+*.db
+*.sqlite3
+
+# ML model (binary — rebuild from trainer.py)
+ml_engine/data/model.joblib
+ml_engine/data/training_data.csv
+
+# Logs
+logs/*.log
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# IDE
+.vscode/
+.idea/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+
+# Coverage
+.coverage
+htmlcov/
+.pytest_cache/
+
+# Distribution
+dist/
+*.zip
+
+# Generated icons (rebuild from generate_icons.py)
+extension/assets/icons/*.png
