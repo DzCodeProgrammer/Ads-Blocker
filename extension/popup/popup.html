@@ -11,26 +11,28 @@
   <!-- Header -->
   <header class="header">
     <div class="logo">
-      <img src="../assets/icons/icon48.png" alt="logo" width="24" height="24" />
+      <img src="../assets/icons/icon48.png" alt="" width="22" height="22" />
       <span class="logo-text">AdBlocker <strong>Pro</strong></span>
     </div>
     <div class="header-controls">
+      <span id="siteMode" class="site-mode-badge normal" title="Blocking mode for this site"></span>
       <button id="darkModeBtn" class="icon-btn" title="Toggle dark mode">🌙</button>
-      <label class="toggle-switch" title="Enable / Disable">
+      <label class="toggle-switch" title="Enable / Disable globally">
         <input type="checkbox" id="mainToggle" checked />
         <span class="slider"></span>
       </label>
     </div>
   </header>
 
-  <!-- Status banner -->
+  <!-- Status + current site -->
   <div id="statusBanner" class="status-banner active">
     <span id="statusText">Protection Active</span>
+    <span id="currentSite" class="current-site"></span>
   </div>
 
-  <!-- Stats cards -->
+  <!-- Stats row -->
   <section class="stats-grid">
-    <div class="stat-card">
+    <div class="stat-card accent">
       <div class="stat-value" id="totalBlocked">—</div>
       <div class="stat-label">Total Blocked</div>
     </div>
@@ -50,69 +52,206 @@
 
   <!-- Tabs -->
   <nav class="tabs">
-    <button class="tab-btn active" data-tab="dashboard">Dashboard</button>
-    <button class="tab-btn" data-tab="whitelist">Whitelist</button>
-    <button class="tab-btn" data-tab="advanced">Advanced</button>
+    <button class="tab-btn active" data-tab="overview">Overview</button>
+    <button class="tab-btn" data-tab="netlog">Network</button>
+    <button class="tab-btn" data-tab="filters">Filters</button>
+    <button class="tab-btn" data-tab="lists">Lists</button>
+    <button class="tab-btn" data-tab="options">Options</button>
   </nav>
 
-  <!-- Dashboard tab -->
-  <section class="tab-content active" id="tab-dashboard">
-    <h3 class="section-title">Top Blocked Domains</h3>
-    <ul id="topDomainsList" class="domain-list">
+  <!-- ══ Tab: Overview ═════════════════════════════════════════════════════ -->
+  <section class="tab-content active" id="tab-overview">
+
+    <!-- Per-site blocking mode -->
+    <div class="card">
+      <div class="card-title">This Site</div>
+      <div id="siteDomain" class="site-domain-label">Loading…</div>
+      <div class="mode-buttons">
+        <button class="mode-btn" data-mode="disabled">Off</button>
+        <button class="mode-btn active" data-mode="normal">Normal</button>
+        <button class="mode-btn" data-mode="aggressive">Aggressive</button>
+      </div>
+      <button id="pickerBtn" class="btn-outline full-width mt-8">
+        🎯 Element Picker
+      </button>
+    </div>
+
+    <!-- Top domains -->
+    <div class="card">
+      <div class="card-title">Top Blocked Domains</div>
+      <ul id="topDomainsList" class="domain-list">
+        <li class="placeholder">Loading…</li>
+      </ul>
+    </div>
+
+    <!-- Daily chart -->
+    <div class="card">
+      <div class="card-title">Activity (7 days)</div>
+      <canvas id="dailyChart" width="320" height="100"></canvas>
+    </div>
+
+  </section>
+
+  <!-- ══ Tab: Network Log ═══════════════════════════════════════════════════ -->
+  <section class="tab-content" id="tab-netlog">
+    <div class="netlog-toolbar">
+      <div class="filter-chips">
+        <button class="chip active" data-filter="all">All</button>
+        <button class="chip" data-filter="blocked">Blocked</button>
+        <button class="chip" data-filter="allowed">Allowed</button>
+        <button class="chip" data-filter="tracker">Trackers</button>
+        <button class="chip" data-filter="cname">CNAME</button>
+      </div>
+      <button id="clearLogBtn" class="btn-icon" title="Clear log">🗑</button>
+    </div>
+    <div id="netlogList" class="netlog-list">
+      <div class="placeholder">Waiting for requests…</div>
+    </div>
+  </section>
+
+  <!-- ══ Tab: Filters ══════════════════════════════════════════════════════ -->
+  <section class="tab-content" id="tab-filters">
+
+    <!-- Whitelist -->
+    <div class="card">
+      <div class="card-title">Whitelist</div>
+      <div class="input-row">
+        <input id="whitelistInput" type="text" placeholder="example.com" maxlength="253" />
+        <button id="addWhitelistBtn" class="btn-primary">Add</button>
+      </div>
+      <ul id="whitelistList" class="domain-list">
+        <li class="placeholder">No whitelisted domains</li>
+      </ul>
+    </div>
+
+    <!-- Custom filter editor -->
+    <div class="card">
+      <div class="card-title">Custom Filters
+        <span class="badge">EasyList syntax</span>
+      </div>
+      <textarea id="customFiltersEditor"
+        placeholder="||ads.example.com^\n@@||safe.example.com^\n##.ad-banner"
+        rows="6"></textarea>
+      <div class="row-end mt-8">
+        <button id="importFiltersBtn" class="btn-secondary">Import</button>
+        <button id="exportFiltersBtn" class="btn-secondary">Export</button>
+        <button id="saveFiltersBtn" class="btn-primary">Save</button>
+      </div>
+      <div id="filtersSaveStatus" class="save-status"></div>
+    </div>
+
+  </section>
+
+  <!-- ══ Tab: Lists ════════════════════════════════════════════════════════ -->
+  <section class="tab-content" id="tab-lists">
+    <div class="lists-toolbar">
+      <button id="updateAllListsBtn" class="btn-secondary full-width">
+        ↻ Update All Lists
+      </button>
+      <div id="listsUpdateStatus" class="save-status"></div>
+    </div>
+    <ul id="filterListsList" class="filter-lists">
       <li class="placeholder">Loading…</li>
     </ul>
-    <h3 class="section-title">Daily Activity (7 days)</h3>
-    <canvas id="dailyChart" width="320" height="120"></canvas>
+    <div class="card mt-8">
+      <div class="card-title">Subscribe to List</div>
+      <div class="input-row">
+        <input id="listUrlInput" type="text" placeholder="https://example.com/filters.txt" />
+        <button id="addListBtn" class="btn-primary">Add</button>
+      </div>
+      <div id="addListStatus" class="save-status"></div>
+    </div>
   </section>
 
-  <!-- Whitelist tab -->
-  <section class="tab-content" id="tab-whitelist">
-    <div class="whitelist-input-row">
-      <input
-        type="text"
-        id="whitelistInput"
-        placeholder="example.com"
-        maxlength="253"
-      />
-      <button id="addWhitelistBtn" class="btn-primary">Add</button>
-    </div>
-    <ul id="whitelistList" class="domain-list">
-      <li class="placeholder">No whitelisted domains</li>
-    </ul>
-  </section>
+  <!-- ══ Tab: Options ═══════════════════════════════════════════════════════ -->
+  <section class="tab-content" id="tab-options">
 
-  <!-- Advanced tab -->
-  <section class="tab-content" id="tab-advanced">
-    <div class="toggle-row">
-      <label>Block Ads</label>
-      <label class="toggle-switch">
-        <input type="checkbox" id="blockAds" checked />
-        <span class="slider"></span>
-      </label>
+    <!-- Feature toggles -->
+    <div class="card">
+      <div class="card-title">Features</div>
+      <div class="toggle-row">
+        <div>
+          <div class="toggle-label">Block Ads</div>
+          <div class="toggle-desc">URL-based ad blocking</div>
+        </div>
+        <label class="toggle-switch"><input type="checkbox" id="blockAds" checked /><span class="slider"></span></label>
+      </div>
+      <div class="toggle-row">
+        <div>
+          <div class="toggle-label">Block Trackers</div>
+          <div class="toggle-desc">Analytics & tracking scripts</div>
+        </div>
+        <label class="toggle-switch"><input type="checkbox" id="blockTrackers" checked /><span class="slider"></span></label>
+      </div>
+      <div class="toggle-row">
+        <div>
+          <div class="toggle-label">Cookie Banners</div>
+          <div class="toggle-desc">Auto-dismiss GDPR dialogs</div>
+        </div>
+        <label class="toggle-switch"><input type="checkbox" id="blockCookieBanners" checked /><span class="slider"></span></label>
+      </div>
+      <div class="toggle-row">
+        <div>
+          <div class="toggle-label">Social Widgets</div>
+          <div class="toggle-desc">Replace FB/Twitter/YT embeds</div>
+        </div>
+        <label class="toggle-switch"><input type="checkbox" id="blockSocial" checked /><span class="slider"></span></label>
+      </div>
+      <div class="toggle-row">
+        <div>
+          <div class="toggle-label">Block Popups</div>
+          <div class="toggle-desc">Auto-close ad popup windows</div>
+        </div>
+        <label class="toggle-switch"><input type="checkbox" id="blockPopups" checked /><span class="slider"></span></label>
+      </div>
+      <div class="toggle-row">
+        <div>
+          <div class="toggle-label">Notification Block</div>
+          <div class="toggle-desc">Auto-deny push notifications</div>
+        </div>
+        <label class="toggle-switch"><input type="checkbox" id="blockNotifications" checked /><span class="slider"></span></label>
+      </div>
+      <div class="toggle-row">
+        <div>
+          <div class="toggle-label">Clean URLs</div>
+          <div class="toggle-desc">Strip UTM & tracking params</div>
+        </div>
+        <label class="toggle-switch"><input type="checkbox" id="cleanUrls" checked /><span class="slider"></span></label>
+      </div>
+      <div class="toggle-row">
+        <div>
+          <div class="toggle-label">CNAME Uncloaking</div>
+          <div class="toggle-desc">Detect hidden tracker CNAMEs</div>
+        </div>
+        <label class="toggle-switch"><input type="checkbox" id="enableCname" checked /><span class="slider"></span></label>
+      </div>
+      <div class="toggle-row">
+        <div>
+          <div class="toggle-label">ML Detection</div>
+          <div class="toggle-desc">AI-based ad identification</div>
+        </div>
+        <label class="toggle-switch"><input type="checkbox" id="enableMl" checked /><span class="slider"></span></label>
+      </div>
+      <div class="toggle-row">
+        <div>
+          <div class="toggle-label">Anti-Fingerprint</div>
+          <div class="toggle-desc">Canvas & audio noise</div>
+        </div>
+        <label class="toggle-switch"><input type="checkbox" id="antiFp" checked /><span class="slider"></span></label>
+      </div>
     </div>
-    <div class="toggle-row">
-      <label>Block Trackers</label>
-      <label class="toggle-switch">
-        <input type="checkbox" id="blockTrackers" checked />
-        <span class="slider"></span>
-      </label>
+
+    <!-- Stats breakdown -->
+    <div class="card">
+      <div class="card-title">Filter Lists Breakdown</div>
+      <div id="rulesBreakdown" class="breakdown-list"></div>
     </div>
-    <div class="toggle-row">
-      <label>ML Detection</label>
-      <label class="toggle-switch">
-        <input type="checkbox" id="enableMl" checked />
-        <span class="slider"></span>
-      </label>
-    </div>
-    <div class="separator"></div>
-    <button id="updateFiltersBtn" class="btn-secondary full-width">
-      Update Filter Lists
-    </button>
-    <div id="updateStatus" class="update-status"></div>
+
   </section>
 
   <footer class="footer">
     <span id="footerStatus">Backend: connecting…</span>
+    <span id="footerVersion">v2.0.0</span>
   </footer>
 
   <script src="popup.js"></script>

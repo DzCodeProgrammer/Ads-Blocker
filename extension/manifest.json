@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "AdBlocker Pro",
-  "version": "1.0.0",
-  "description": "Professional Ad Blocker — blocks ads, trackers, and malware using Python ML backend.",
+  "version": "2.0.0",
+  "description": "Professional Ad Blocker — blocks ads, trackers, cookie banners, popups, and social widgets. ML-powered with CNAME uncloaking.",
   "author": "AdBlocker Team",
   "icons": {
     "16": "assets/icons/icon16.png",
@@ -24,26 +24,59 @@
   "content_scripts": [
     {
       "matches": ["<all_urls>"],
-      "js": ["content_scripts/content.js"],
-      "css": [],
-      "run_at": "document_start"
+      "js": [
+        "content_scripts/scriptlet_injector.js"
+      ],
+      "run_at": "document_start",
+      "all_frames": false
+    },
+    {
+      "matches": ["<all_urls>"],
+      "js": [
+        "content_scripts/content.js",
+        "content_scripts/cookie_banner.js",
+        "content_scripts/notification_blocker.js",
+        "content_scripts/element_picker.js"
+      ],
+      "run_at": "document_start",
+      "all_frames": false
+    },
+    {
+      "matches": ["<all_urls>"],
+      "js": [
+        "content_scripts/social_blocker.js"
+      ],
+      "run_at": "document_idle",
+      "all_frames": false
+    },
+    {
+      "matches": ["*://*.youtube.com/*"],
+      "js": [
+        "content_scripts/youtube_skipper.js"
+      ],
+      "run_at": "document_start",
+      "all_frames": false
     }
   ],
   "permissions": [
     "webRequest",
     "declarativeNetRequest",
     "declarativeNetRequestWithHostAccess",
+    "declarativeNetRequestFeedback",
     "storage",
     "tabs",
     "activeTab",
-    "scripting"
+    "scripting",
+    "webNavigation",
+    "alarms",
+    "notifications"
   ],
   "host_permissions": ["<all_urls>"],
   "declarative_net_request": {
     "rule_resources": []
   },
   "content_security_policy": {
-    "extension_pages": "script-src 'self'; object-src 'none';"
+    "extension_pages": "script-src 'self'; object-src 'none'; connect-src http://127.0.0.1:8765;"
   },
   "web_accessible_resources": [
     {

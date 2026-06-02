@@ -16,6 +16,7 @@ from backend.database.db import init_db
 from backend.api.middleware.security import SecurityHeadersMiddleware
 from backend.api.middleware.rate_limiter import limiter
 from backend.api.routes import filters, stats, settings, whitelist
+from backend.api.routes import logs, site_settings, lists, export, scriptlets
 from backend.services.update_service import start_scheduler, stop_scheduler
 from backend.services.blocking_service import reload_engine
 
@@ -80,6 +81,11 @@ def create_app() -> FastAPI:
     app.include_router(stats.router)
     app.include_router(settings.router)
     app.include_router(whitelist.router)
+    app.include_router(logs.router)
+    app.include_router(site_settings.router)
+    app.include_router(lists.router)
+    app.include_router(export.router)
+    app.include_router(scriptlets.router)
 
     @app.get("/health", tags=["health"])
     async def health():

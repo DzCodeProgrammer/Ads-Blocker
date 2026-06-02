@@ -1,66 +1,127 @@
 /**
- * RequestHandler — all communication with the Python FastAPI backend.
+ * RequestHandler v2 — core blocking engine for the background service worker.
  *
- * The backend runs locally at http://127.0.0.1:8765
- * Extension calls it synchronously-ish via blocking webRequest listener.
- *
- * NOTE: MV3 service workers cannot make synchronous XHR.
- * We use a local in-memory domain cache updated by periodic background fetch
- * so the onBeforeRequest handler can make synchronous decisions from cache.
+ * Enhancements over v1:
+ *   - Content-type filtering (block XHR/scripts/frames per type)
+ *   - Per-site mode awareness (disabled / aggressive)
+ *   - CNAME check via async backend call (updates cache)
+ *   - Cosmetic rule accumulation
+ *   - Callback for badge updates (onBlock)
  */
 
 const BACKEND = 'http://127.0.0.1:8765';
-const CACHE_TTL_MS = 60_000; // re-check backend every 60 s for hot rules
+const CACHE_TTL_MS = 5 * 60 * 1000; // 5 minutes
 
 export class RequestHandler {
   constructor() {
-    this._blockedDomains = new Set();  // fast in-memory cache
+    this._blockedDomains = new Set();
+    this._whitelistedDomains = new Set();
     this._settings = {
-      is_enabled: true,
-      block_ads: true,
-      block_trackers: true,
-      enable_ml: true,
+      is_enabled: true, block_ads: true, block_trackers: true,
+      enable_ml: true, block_cookie_banners: true, block_social: true,
+      block_popups: true, block_notifications: true, clean_urls: true,
+      enable_cname: true, anti_fingerprint: true,
     };
-    this._stats = { blocked_today: 0, total_blocked: 0, tracker_blocked: 0 };
+    this._cosmeticRules = [];
     this._lastCacheUpdate = 0;
+    this.onBlock = null; // callback for badge
   }
 
-  // ── Init ────────────────────────────────────────────────────────────────
+  // ── Init / Cache ──────────────────────────────────────────────────────────
 
   async init() {
     await this._loadSettings();
-    await this._refreshCache();
-    // Periodic refresh
-    setInterval(() => this._refreshCache(), CACHE_TTL_MS);
+    await this.refreshCache();
+    await this._loadWhitelist();
   }
 
-  // ── Core request check ──────────────────────────────────────────────────
+  async refreshCache() {
+    try {
+      const [blRes, wlRes] = await Promise.all([
+        fetch(`${BACKEND}/api/filters?rule_type=blacklist`),
+        fetch(`${BACKEND}/api/filters?rule_type=whitelist`),
+      ]);
+      if (blRes.ok) {
+        const rules = await blRes.json();
+        this._blockedDomains = new Set(rules.map(r => r.pattern));
+      }
+      if (wlRes.ok) {
+        const wl = await wlRes.json();
+        this._whitelistedDomains = new Set(wl.map(r => r.pattern));
+      }
+      this._lastCacheUpdate = Date.now();
+    } catch (_) {}
+  }
 
-  onBeforeRequest(details) {
+  async _loadWhitelist() {
+    try {
+      const res = await fetch(`${BACKEND}/api/whitelist`);
+      if (res.ok) {
+        const items = await res.json();
+        items.forEach(i => this._whitelistedDomains.add(i.domain));
+      }
+    } catch (_) {}
+  }
+
+  // ── Core request check ────────────────────────────────────────────────────
+
+  onBeforeRequest(details, perSite) {
     if (!this._settings.is_enabled) return { cancel: false };
-    if (!this._shouldCheck(details)) return { cancel: false };
 
     const url = details.url;
-    const domain = this._extractDomain(url);
-
-    // Fast-path cache check
-    if (this._blockedDomains.has(domain)) {
-      this._recordBlock(url, domain, details.documentUrl);
-      return { cancel: true };
+    // Skip extension internals and backend
+    if (url.includes('127.0.0.1:8765') || url.startsWith('chrome-extension://') ||
+        url.startsWith('moz-extension://') || url.startsWith('ms-browser-extension://')) {
+      return { cancel: false };
     }
 
-    // Async backend check (non-blocking, updates cache for next request)
-    this._checkBackendAsync(url, details.documentUrl);
+    const domain = this._extractDomain(url);
+    const tabDomain = this._extractDomain(details.documentUrl || details.initiator || '');
+    const isThirdParty = tabDomain && domain !== tabDomain && !domain.endsWith('.' + tabDomain);
+
+    // ── Per-site disable check ────────────────────────────────────────────
+    if (perSite && tabDomain && perSite.isDisabled(tabDomain)) {
+      return { cancel: false };
+    }
+
+    // ── Whitelist fast path ───────────────────────────────────────────────
+    if (this._isWhitelisted(domain)) return { cancel: false };
+
+    // ── Cache check (fast O(1) domain lookup) ────────────────────────────
+    const etld1 = this._getETLD1(domain);
+    if (this._blockedDomains.has(domain) || this._blockedDomains.has(etld1)) {
+      this._reportBlock(url, domain, details);
+      return { cancel: true, matchedRule: domain, isTracker: false };
+    }
+
+    // ── Tracker heuristic ─────────────────────────────────────────────────
+    if (this._settings.block_trackers && this._isTracker(domain)) {
+      this._reportBlock(url, domain, details);
+      return { cancel: true, matchedRule: `tracker:${domain}`, isTracker: true };
+    }
+
+    // ── Content-type blocking (3rd-party scripts/XHR/frames) ─────────────
+    if (isThirdParty && this._shouldBlockByType(details.type, perSite, tabDomain)) {
+      this._reportBlock(url, domain, details);
+      return { cancel: true, matchedRule: `type:${details.type}`, isTracker: false };
+    }
+
+    // ── Async backend check (updates cache for next hit) ─────────────────
+    this._checkBackendAsync(url, details.documentUrl, details.type);
+
     return { cancel: false };
   }
 
-  _shouldCheck(details) {
-    // Skip extension-internal and backend requests to avoid loops
-    const skip = ['chrome-extension://', 'moz-extension://', '127.0.0.1:8765'];
-    return !skip.some((s) => details.url.includes(s));
+  _shouldBlockByType(type, perSite, siteDomain) {
+    if (!type) return false;
+    const aggressive = perSite && siteDomain && perSite.isAggressive(siteDomain);
+    // In aggressive mode: block all 3rd-party scripts, XHR, frames
+    if (aggressive) return ['script', 'xmlhttprequest', 'sub_frame', 'websocket'].includes(type);
+    // Normal: block websocket and ping only
+    return ['websocket', 'ping'].includes(type);
   }
 
-  async _checkBackendAsync(url, tabUrl) {
+  async _checkBackendAsync(url, tabUrl, contentType) {
     try {
       const res = await fetch(`${BACKEND}/api/filters/check`, {
         method: 'POST',
@@ -71,44 +132,21 @@ export class RequestHandler {
       const data = await res.json();
       if (data.blocked) {
         this._blockedDomains.add(data.domain);
-        // Update badge
-        chrome.action.setBadgeText({ text: String(++this._stats.blocked_today) });
-        chrome.action.setBadgeBackgroundColor({ color: '#E53E3E' });
+        if (typeof this.onBlock === 'function') this.onBlock(data.domain);
       }
-    } catch (_) {
-      // Backend unreachable — fail open (don't block)
-    }
-  }
-
-  _recordBlock(url, domain, tabUrl) {
-    fetch(`${BACKEND}/api/filters/check`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ url, tab_url: tabUrl, enable_ml: false }),
-    }).catch(() => {});
-    this._stats.blocked_today++;
-    chrome.action.setBadgeText({ text: String(this._stats.blocked_today) });
-    chrome.action.setBadgeBackgroundColor({ color: '#E53E3E' });
-  }
-
-  // ── Cache refresh ───────────────────────────────────────────────────────
-
-  async _refreshCache() {
-    try {
-      const res = await fetch(`${BACKEND}/api/filters?rule_type=blacklist`);
-      if (!res.ok) return;
-      const rules = await res.json();
-      this._blockedDomains = new Set(rules.map((r) => r.pattern));
-      this._lastCacheUpdate = Date.now();
     } catch (_) {}
   }
 
-  // ── Settings ────────────────────────────────────────────────────────────
+  _reportBlock(url, domain, details) {
+    if (typeof this.onBlock === 'function') this.onBlock(domain);
+  }
+
+  // ── Settings ──────────────────────────────────────────────────────────────
 
   async _loadSettings() {
     try {
       const res = await fetch(`${BACKEND}/api/settings`);
-      if (res.ok) this._settings = await res.json();
+      if (res.ok) this._settings = { ...this._settings, ...(await res.json()) };
     } catch (_) {}
   }
 
@@ -118,61 +156,103 @@ export class RequestHandler {
   }
 
   async setSettings(payload) {
+    this._settings = { ...this._settings, ...payload };
     await fetch(`${BACKEND}/api/settings`, {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(payload),
-    });
-    this._settings = { ...this._settings, ...payload };
+    }).catch(() => {});
     return { status: 'updated' };
   }
 
-  // ── Stats ───────────────────────────────────────────────────────────────
+  // ── Stats ─────────────────────────────────────────────────────────────────
 
   async getStats() {
     try {
       const res = await fetch(`${BACKEND}/api/stats/summary`);
-      if (res.ok) return await res.json();
-    } catch (_) {}
-    return this._stats;
+      return res.ok ? await res.json() : {};
+    } catch (_) { return {}; }
   }
 
-  // ── Whitelist ───────────────────────────────────────────────────────────
+  // ── Whitelist ──────────────────────────────────────────────────────────────
 
   async getWhitelist() {
-    const res = await fetch(`${BACKEND}/api/whitelist`);
-    return res.ok ? await res.json() : [];
+    try {
+      const res = await fetch(`${BACKEND}/api/whitelist`);
+      return res.ok ? await res.json() : [];
+    } catch (_) { return []; }
   }
 
   async addWhitelist(domain) {
+    if (!domain) return { error: 'No domain' };
     const res = await fetch(`${BACKEND}/api/whitelist`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ domain }),
-    });
-    if (res.ok) this._blockedDomains.delete(domain);
-    return res.ok ? { status: 'whitelisted' } : { error: 'Failed' };
+    }).catch(() => null);
+    if (res?.ok) {
+      this._whitelistedDomains.add(domain);
+      this._blockedDomains.delete(domain);
+      return { status: 'whitelisted' };
+    }
+    return { error: 'Failed' };
   }
 
   async removeWhitelist(id) {
-    const res = await fetch(`${BACKEND}/api/whitelist/${id}`, { method: 'DELETE' });
-    return res.ok ? { status: 'removed' } : { error: 'Failed' };
+    const res = await fetch(`${BACKEND}/api/whitelist/${id}`, { method: 'DELETE' }).catch(() => null);
+    await this._loadWhitelist(); // refresh cache
+    return res?.ok ? { status: 'removed' } : { error: 'Failed' };
   }
 
-  // ── Admin ───────────────────────────────────────────────────────────────
+  // ── Cosmetic rules ────────────────────────────────────────────────────────
+
+  async addCosmeticRule(rule, selector) {
+    this._cosmeticRules.push({ rule, selector });
+    // Also save to backend as custom filter
+    await fetch(`${BACKEND}/api/filters`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ pattern: selector, rule_type: 'blacklist', comment: `Cosmetic: ${rule}` }),
+    }).catch(() => {});
+    return { status: 'added' };
+  }
+
+  // ── Trigger update ────────────────────────────────────────────────────────
 
   async triggerUpdate() {
-    const res = await fetch(`${BACKEND}/api/filters/update`, { method: 'POST' });
-    return res.ok ? await res.json() : { error: 'Update failed' };
+    const res = await fetch(`${BACKEND}/api/filters/update`, { method: 'POST' }).catch(() => null);
+    if (res?.ok) {
+      await this.refreshCache();
+      return await res.json();
+    }
+    return { error: 'Update failed' };
   }
 
-  // ── Helpers ─────────────────────────────────────────────────────────────
+  // ── Helpers ───────────────────────────────────────────────────────────────
+
+  _isWhitelisted(domain) {
+    return this._whitelistedDomains.has(domain) ||
+      this._whitelistedDomains.has(this._getETLD1(domain));
+  }
+
+  _isTracker(domain) {
+    const kws = [
+      'doubleclick', 'googlesyndication', 'googletagmanager', 'analytics',
+      'tracking', 'tracker', 'pixel', 'beacon', 'telemetry', 'hotjar',
+      'mixpanel', 'segment.io', 'amplitude', 'fullstory', 'sentry.io',
+      'criteo', 'taboola', 'outbrain', 'adnxs', 'quantserve', 'scorecardresearch',
+    ];
+    const dl = domain.toLowerCase();
+    return kws.some(k => dl.includes(k));
+  }
 
   _extractDomain(url) {
-    try {
-      return new URL(url).hostname.replace(/^www\./, '');
-    } catch (_) {
-      return '';
-    }
+    try { return new URL(url).hostname.replace(/^www\./, ''); }
+    catch (_) { return ''; }
+  }
+
+  _getETLD1(domain) {
+    const parts = domain.split('.');
+    return parts.length >= 2 ? parts.slice(-2).join('.') : domain;
   }
 }
