@@ -19,13 +19,15 @@ logger = logging.getLogger(__name__)
 def main() -> None:
     settings = get_settings()
     logger.info(f"Starting AdBlocker backend on {settings.APP_HOST}:{settings.APP_PORT}")
-    app = create_app()
+    is_dev = settings.APP_ENV == "development"
     uvicorn.run(
-        app,
+        # Import string required when reload=True; direct object otherwise
+        "backend.api.main:create_app" if is_dev else create_app(),
+        factory=is_dev,
         host=settings.APP_HOST,
         port=settings.APP_PORT,
         log_level=settings.LOG_LEVEL.lower(),
-        reload=settings.APP_ENV == "development",
+        reload=is_dev,
     )
 
 
