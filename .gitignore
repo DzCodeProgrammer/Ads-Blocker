@@ -18,6 +18,8 @@ venv/
 
 # Database
 *.db
+*.db-shm
+*.db-wal
 *.sqlite3
 
 # ML model (binary — rebuild from trainer.py)
