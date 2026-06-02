@@ -49,5 +49,5 @@ htmlcov/
 dist/
 *.zip
 
-# Generated icons (rebuild from generate_icons.py)
-extension/assets/icons/*.png
+# Icons are included in repo
+# extension/assets/icons/*.png
