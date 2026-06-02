@@ -1,20 +1,68 @@
 /**
- * RequestHandler v2 — core blocking engine for the background service worker.
+ * RequestHandler v3 — MV3-compliant blocking via declarativeNetRequest (DNR).
  *
- * Enhancements over v1:
- *   - Content-type filtering (block XHR/scripts/frames per type)
- *   - Per-site mode awareness (disabled / aggressive)
- *   - CNAME check via async backend call (updates cache)
- *   - Cosmetic rule accumulation
- *   - Callback for badge updates (onBlock)
+ * MV3 Chrome no longer allows webRequest with ['blocking'].
+ * Actual request blocking is done by Chrome's declarativeNetRequest engine.
+ * webRequest is used only for non-blocking observation (logging, badge).
+ *
+ * Architecture:
+ *   1. Blocked domains → converted to DNR dynamic rules (blocks in Chrome engine)
+ *   2. webRequest.onBeforeRequest (no 'blocking') → observe all requests for logging
+ *   3. Backend ML/CNAME check → async, adds new DNR rules when threats detected
  */
 
 const BACKEND = 'http://127.0.0.1:8765';
-const CACHE_TTL_MS = 5 * 60 * 1000; // 5 minutes
+const DNR_RULE_ID_START = 1;
+const MAX_DNR_RULES = 29_000;
+
+// Well-known tracker keywords for heuristic fast-path
+const TRACKER_KEYWORDS = [
+  'doubleclick', 'googlesyndication', 'googletagmanager', 'analytics',
+  'tracking', 'tracker', 'pixel', 'beacon', 'hotjar', 'mixpanel',
+  'segment.io', 'amplitude', 'fullstory', 'sentry.io', 'criteo',
+  'taboola', 'outbrain', 'adnxs', 'quantserve', 'scorecardresearch',
+];
+
+// Built-in tracker domains (always blocked even without filter lists)
+const BUILTIN_BLOCK_DOMAINS = [
+  'doubleclick.net', 'googlesyndication.com', 'googletagservices.com',
+  'googletagmanager.com', 'adservice.google.com', 'adservice.google.co.uk',
+  'ads.youtube.com', 'pagead2.googlesyndication.com',
+  'connect.facebook.net', 'an.facebook.com', 'pixel.facebook.com',
+  'bat.bing.com', 'ads.twitter.com', 'static.ads-twitter.com',
+  'trc.taboola.com', 'cdn.taboola.com', 'widgets.outbrain.com',
+  'amplify.outbrain.com', 'log.outbrain.com',
+  'adnxs.com', 'ads.yahoo.com', 'ats.yahoo.com',
+  'scorecardresearch.com', 'quantserve.com',
+  'hotjar.com', 'static.hotjar.com', 'script.hotjar.com',
+  'mixpanel.com', 'cdn.mxpnl.com',
+  'amplitude.com', 'api.amplitude.com', 'api2.amplitude.com',
+  'fullstory.com', 'rs.fullstory.com', 'edge.fullstory.com',
+  'mouseflow.com', 'cdn.mouseflow.com',
+  'crazyegg.com', 'script.crazyegg.com',
+  'criteo.com', 'dis.criteo.com', 'static.criteo.net',
+  'moatads.com', 'px.moatads.com',
+  'doubleverify.com', 'cdn.doubleverify.com',
+  'adsrvr.org', 'insight.adsrvr.org',
+  'rubiconproject.com', 'fastlane.rubiconproject.com',
+  'pubmatic.com', 'ads.pubmatic.com', 'image6.pubmatic.com',
+  'openx.net', 'u.openx.net', 'ads.openx.net',
+  'casalemedia.com', 'ssum-sec.casalemedia.com',
+  'adsystem.com', 'adserver.com',
+  'chartbeat.com', 'static.chartbeat.com',
+  'newrelic.com', 'js-agent.newrelic.com', 'bam.nr-data.net',
+  'sentry.io', 'ingest.sentry.io',
+  'segment.io', 'api.segment.io', 'cdn.segment.com',
+  'yieldmanager.com', 'adtech.com',
+  'advertising.com', 'pixel.advertising.com',
+  'exoclick.com', 'server.js.exoclick.com',
+  'popads.net', 'popcash.net', 'adcash.com',
+  'trafficjunky.net', 'juicyads.com',
+];
 
 export class RequestHandler {
   constructor() {
-    this._blockedDomains = new Set();
+    this._blockedDomains = new Set(BUILTIN_BLOCK_DOMAINS);
     this._whitelistedDomains = new Set();
     this._settings = {
       is_enabled: true, block_ads: true, block_trackers: true,
@@ -22,103 +70,124 @@ export class RequestHandler {
       block_popups: true, block_notifications: true, clean_urls: true,
       enable_cname: true, anti_fingerprint: true,
     };
-    this._cosmeticRules = [];
-    this._lastCacheUpdate = 0;
-    this.onBlock = null; // callback for badge
+    this.onBlock = null;
+    this._dnrRuleCount = 0;
   }
 
-  // ── Init / Cache ──────────────────────────────────────────────────────────
+  // ── Init ──────────────────────────────────────────────────────────────────
 
   async init() {
     await this._loadSettings();
-    await this.refreshCache();
     await this._loadWhitelist();
+    await this.refreshCache();          // loads blocked domains from backend
+    await this._syncDNRRules();         // push rules to Chrome DNR engine
   }
 
-  async refreshCache() {
+  // ── DNR Rule Management ───────────────────────────────────────────────────
+
+  async _syncDNRRules() {
+    if (!this._settings.is_enabled) {
+      await this._clearDNRRules();
+      return;
+    }
+
+    const domains = [...this._blockedDomains]
+      .filter(d => !this._whitelistedDomains.has(d))
+      .slice(0, MAX_DNR_RULES);
+
+    const newRules = domains.map((domain, i) => ({
+      id: DNR_RULE_ID_START + i,
+      priority: 1,
+      action: { type: 'block' },
+      condition: {
+        urlFilter: `||${domain}^`,
+        resourceTypes: [
+          'script', 'image', 'xmlhttprequest', 'sub_frame',
+          'media', 'font', 'websocket', 'ping', 'other',
+        ],
+      },
+    }));
+
     try {
-      const [blRes, wlRes] = await Promise.all([
-        fetch(`${BACKEND}/api/filters?rule_type=blacklist`),
-        fetch(`${BACKEND}/api/filters?rule_type=whitelist`),
-      ]);
-      if (blRes.ok) {
-        const rules = await blRes.json();
-        this._blockedDomains = new Set(rules.map(r => r.pattern));
-      }
-      if (wlRes.ok) {
-        const wl = await wlRes.json();
-        this._whitelistedDomains = new Set(wl.map(r => r.pattern));
-      }
-      this._lastCacheUpdate = Date.now();
+      const existing = await chrome.declarativeNetRequest.getDynamicRules();
+      await chrome.declarativeNetRequest.updateDynamicRules({
+        removeRuleIds: existing.map(r => r.id),
+        addRules: newRules,
+      });
+      this._dnrRuleCount = newRules.length;
+      console.log(`[AdBlocker] DNR: ${newRules.length} rules synced`);
+    } catch (err) {
+      console.error('[AdBlocker] DNR sync error:', err.message);
+    }
+  }
+
+  async _clearDNRRules() {
+    try {
+      const existing = await chrome.declarativeNetRequest.getDynamicRules();
+      await chrome.declarativeNetRequest.updateDynamicRules({
+        removeRuleIds: existing.map(r => r.id),
+        addRules: [],
+      });
     } catch (_) {}
   }
 
-  async _loadWhitelist() {
-    try {
-      const res = await fetch(`${BACKEND}/api/whitelist`);
-      if (res.ok) {
-        const items = await res.json();
-        items.forEach(i => this._whitelistedDomains.add(i.domain));
-      }
-    } catch (_) {}
+  async _addDNRRuleForDomain(domain) {
+    const existing = await chrome.declarativeNetRequest.getDynamicRules();
+    const nextId = existing.length > 0
+      ? Math.max(...existing.map(r => r.id)) + 1
+      : DNR_RULE_ID_START;
+
+    const alreadyExists = existing.some(r =>
+      r.condition?.urlFilter === `||${domain}^`
+    );
+    if (alreadyExists) return;
+
+    await chrome.declarativeNetRequest.updateDynamicRules({
+      removeRuleIds: [],
+      addRules: [{
+        id: nextId,
+        priority: 1,
+        action: { type: 'block' },
+        condition: {
+          urlFilter: `||${domain}^`,
+          resourceTypes: ['script', 'image', 'xmlhttprequest', 'sub_frame',
+                          'media', 'font', 'websocket', 'ping', 'other'],
+        },
+      }],
+    });
   }
 
-  // ── Core request check ────────────────────────────────────────────────────
+  // ── Observation (non-blocking) ────────────────────────────────────────────
+  // Called from background.js webRequest.onBeforeRequest (no 'blocking' flag)
 
-  onBeforeRequest(details, perSite) {
-    if (!this._settings.is_enabled) return { cancel: false };
-
+  observeRequest(details) {
     const url = details.url;
-    // Skip extension internals and backend
-    if (url.includes('127.0.0.1:8765') || url.startsWith('chrome-extension://') ||
-        url.startsWith('moz-extension://') || url.startsWith('ms-browser-extension://')) {
-      return { cancel: false };
+    if (url.includes('127.0.0.1:8765') ||
+        url.startsWith('chrome-extension://') ||
+        url.startsWith('moz-extension://') ||
+        url.startsWith('data:') ||
+        url.startsWith('chrome:')) {
+      return { isTracker: false, knownBlocked: false };
     }
 
     const domain = this._extractDomain(url);
-    const tabDomain = this._extractDomain(details.documentUrl || details.initiator || '');
-    const isThirdParty = tabDomain && domain !== tabDomain && !domain.endsWith('.' + tabDomain);
+    const isTracker = this._isTracker(domain);
 
-    // ── Per-site disable check ────────────────────────────────────────────
-    if (perSite && tabDomain && perSite.isDisabled(tabDomain)) {
-      return { cancel: false };
+    // Check if domain is in our block set (will be/was blocked by DNR)
+    const knownBlocked = this._blockedDomains.has(domain) ||
+                         this._blockedDomains.has(this._getETLD1(domain));
+
+    // Async: check backend for unknown domains, add to DNR if threat found
+    if (!knownBlocked && !this._isWhitelisted(domain)) {
+      this._checkBackendAsync(url, details.documentUrl, details.type);
     }
 
-    // ── Whitelist fast path ───────────────────────────────────────────────
-    if (this._isWhitelisted(domain)) return { cancel: false };
-
-    // ── Cache check (fast O(1) domain lookup) ────────────────────────────
-    const etld1 = this._getETLD1(domain);
-    if (this._blockedDomains.has(domain) || this._blockedDomains.has(etld1)) {
-      this._reportBlock(url, domain, details);
-      return { cancel: true, matchedRule: domain, isTracker: false };
+    // Fire badge callback for known blocked domains
+    if (knownBlocked || isTracker) {
+      if (typeof this.onBlock === 'function') this.onBlock(domain);
     }
 
-    // ── Tracker heuristic ─────────────────────────────────────────────────
-    if (this._settings.block_trackers && this._isTracker(domain)) {
-      this._reportBlock(url, domain, details);
-      return { cancel: true, matchedRule: `tracker:${domain}`, isTracker: true };
-    }
-
-    // ── Content-type blocking (3rd-party scripts/XHR/frames) ─────────────
-    if (isThirdParty && this._shouldBlockByType(details.type, perSite, tabDomain)) {
-      this._reportBlock(url, domain, details);
-      return { cancel: true, matchedRule: `type:${details.type}`, isTracker: false };
-    }
-
-    // ── Async backend check (updates cache for next hit) ─────────────────
-    this._checkBackendAsync(url, details.documentUrl, details.type);
-
-    return { cancel: false };
-  }
-
-  _shouldBlockByType(type, perSite, siteDomain) {
-    if (!type) return false;
-    const aggressive = perSite && siteDomain && perSite.isAggressive(siteDomain);
-    // In aggressive mode: block all 3rd-party scripts, XHR, frames
-    if (aggressive) return ['script', 'xmlhttprequest', 'sub_frame', 'websocket'].includes(type);
-    // Normal: block websocket and ping only
-    return ['websocket', 'ping'].includes(type);
+    return { isTracker, knownBlocked };
   }
 
   async _checkBackendAsync(url, tabUrl, contentType) {
@@ -126,27 +195,61 @@ export class RequestHandler {
       const res = await fetch(`${BACKEND}/api/filters/check`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ url, tab_url: tabUrl, enable_ml: this._settings.enable_ml }),
+        body: JSON.stringify({
+          url, tab_url: tabUrl,
+          enable_ml: this._settings.enable_ml,
+        }),
       });
       if (!res.ok) return;
       const data = await res.json();
-      if (data.blocked) {
-        this._blockedDomains.add(data.domain);
-        if (typeof this.onBlock === 'function') this.onBlock(data.domain);
+      if (data.blocked && data.domain) {
+        if (!this._blockedDomains.has(data.domain)) {
+          this._blockedDomains.add(data.domain);
+          await this._addDNRRuleForDomain(data.domain);
+        }
       }
     } catch (_) {}
   }
 
-  _reportBlock(url, domain, details) {
-    if (typeof this.onBlock === 'function') this.onBlock(domain);
+  // ── Cache refresh ─────────────────────────────────────────────────────────
+
+  async refreshCache() {
+    try {
+      const [blRes, wlRes] = await Promise.all([
+        fetch(`${BACKEND}/api/filters?rule_type=blacklist`).catch(() => null),
+        fetch(`${BACKEND}/api/filters?rule_type=whitelist`).catch(() => null),
+      ]);
+      if (blRes?.ok) {
+        const rules = await blRes.json();
+        rules.forEach(r => this._blockedDomains.add(r.pattern));
+      }
+      if (wlRes?.ok) {
+        const wl = await wlRes.json();
+        wl.forEach(r => this._whitelistedDomains.add(r.pattern));
+      }
+    } catch (_) {}
+
+    // Always add built-ins
+    BUILTIN_BLOCK_DOMAINS.forEach(d => this._blockedDomains.add(d));
+    await this._syncDNRRules();
+  }
+
+  async _loadWhitelist() {
+    try {
+      const res = await fetch(`${BACKEND}/api/whitelist`).catch(() => null);
+      if (res?.ok) {
+        const items = await res.json();
+        items.forEach(i => this._whitelistedDomains.add(i.domain));
+      }
+    } catch (_) {}
   }
 
   // ── Settings ──────────────────────────────────────────────────────────────
 
   async _loadSettings() {
     try {
-      const res = await fetch(`${BACKEND}/api/settings`);
-      if (res.ok) this._settings = { ...this._settings, ...(await res.json()) };
+      const res = await fetch(`${BACKEND}/api/settings`).catch(() => null);
+      if (res?.ok) this._settings = { ...this._settings, ...(await res.json()) };
     } catch (_) {}
   }
 
@@ -162,6 +265,9 @@ export class RequestHandler {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(payload),
     }).catch(() => {});
+
+    // If toggling main switch, sync DNR rules
+    if ('is_enabled' in payload) await this._syncDNRRules();
     return { status: 'updated' };
   }
 
@@ -169,50 +275,58 @@ export class RequestHandler {
 
   async getStats() {
     try {
-      const res = await fetch(`${BACKEND}/api/stats/summary`);
-      return res.ok ? await res.json() : {};
-    } catch (_) { return {}; }
+      const res = await fetch(`${BACKEND}/api/stats/summary`).catch(() => null);
+      const data = res?.ok ? await res.json() : {};
+      return { ...data, dnr_rules: this._dnrRuleCount };
+    } catch (_) { return { dnr_rules: this._dnrRuleCount }; }
   }
 
   // ── Whitelist ──────────────────────────────────────────────────────────────
 
   async getWhitelist() {
     try {
-      const res = await fetch(`${BACKEND}/api/whitelist`);
-      return res.ok ? await res.json() : [];
+      const res = await fetch(`${BACKEND}/api/whitelist`).catch(() => null);
+      return res?.ok ? await res.json() : [];
     } catch (_) { return []; }
   }
 
   async addWhitelist(domain) {
     if (!domain) return { error: 'No domain' };
-    const res = await fetch(`${BACKEND}/api/whitelist`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ domain }),
-    }).catch(() => null);
-    if (res?.ok) {
-      this._whitelistedDomains.add(domain);
-      this._blockedDomains.delete(domain);
-      return { status: 'whitelisted' };
-    }
+    try {
+      const res = await fetch(`${BACKEND}/api/whitelist`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ domain }),
+      });
+      if (res?.ok) {
+        this._whitelistedDomains.add(domain);
+        this._blockedDomains.delete(domain);
+        await this._syncDNRRules();
+        return { status: 'whitelisted' };
+      }
+    } catch (_) {}
     return { error: 'Failed' };
   }
 
   async removeWhitelist(id) {
-    const res = await fetch(`${BACKEND}/api/whitelist/${id}`, { method: 'DELETE' }).catch(() => null);
-    await this._loadWhitelist(); // refresh cache
-    return res?.ok ? { status: 'removed' } : { error: 'Failed' };
+    try {
+      await fetch(`${BACKEND}/api/whitelist/${id}`, { method: 'DELETE' });
+      await this._loadWhitelist();
+      await this._syncDNRRules();
+      return { status: 'removed' };
+    } catch (_) { return { error: 'Failed' }; }
   }
 
   // ── Cosmetic rules ────────────────────────────────────────────────────────
 
   async addCosmeticRule(rule, selector) {
-    this._cosmeticRules.push({ rule, selector });
-    // Also save to backend as custom filter
     await fetch(`${BACKEND}/api/filters`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ pattern: selector, rule_type: 'blacklist', comment: `Cosmetic: ${rule}` }),
+      body: JSON.stringify({
+        pattern: selector, rule_type: 'blacklist',
+        comment: `Cosmetic: ${rule}`,
+      }),
     }).catch(() => {});
     return { status: 'added' };
   }
@@ -220,12 +334,14 @@ export class RequestHandler {
   // ── Trigger update ────────────────────────────────────────────────────────
 
   async triggerUpdate() {
-    const res = await fetch(`${BACKEND}/api/filters/update`, { method: 'POST' }).catch(() => null);
-    if (res?.ok) {
-      await this.refreshCache();
-      return await res.json();
-    }
-    return { error: 'Update failed' };
+    try {
+      const res = await fetch(`${BACKEND}/api/filters/update`, { method: 'POST' });
+      const data = res?.ok ? await res.json() : { error: 'Failed' };
+      if (data.total_rules) {
+        await this.refreshCache(); // also re-syncs DNR rules
+      }
+      return data;
+    } catch (_) { return { error: 'Update failed' }; }
   }
 
   // ── Helpers ───────────────────────────────────────────────────────────────
@@ -236,14 +352,8 @@ export class RequestHandler {
   }
 
   _isTracker(domain) {
-    const kws = [
-      'doubleclick', 'googlesyndication', 'googletagmanager', 'analytics',
-      'tracking', 'tracker', 'pixel', 'beacon', 'telemetry', 'hotjar',
-      'mixpanel', 'segment.io', 'amplitude', 'fullstory', 'sentry.io',
-      'criteo', 'taboola', 'outbrain', 'adnxs', 'quantserve', 'scorecardresearch',
-    ];
     const dl = domain.toLowerCase();
-    return kws.some(k => dl.includes(k));
+    return TRACKER_KEYWORDS.some(k => dl.includes(k));
   }
 
   _extractDomain(url) {

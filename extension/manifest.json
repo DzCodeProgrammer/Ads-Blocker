@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "AdBlocker Pro",
-  "version": "2.0.0",
-  "description": "Professional Ad Blocker — blocks ads, trackers, cookie banners, popups, and social widgets. ML-powered with CNAME uncloaking.",
+  "version": "2.1.0",
+  "description": "Professional Ad Blocker — blocks ads, trackers, cookie banners, popups. ML-powered with CNAME uncloaking.",
   "author": "AdBlocker Team",
   "icons": {
     "16": "assets/icons/icon16.png",
@@ -15,7 +15,8 @@
       "16": "assets/icons/icon16.png",
       "48": "assets/icons/icon48.png"
     },
-    "default_title": "AdBlocker Pro"
+    "default_title": "AdBlocker Pro",
+    "default_badge_text": ""
   },
   "background": {
     "service_worker": "background/background.js",
@@ -24,9 +25,7 @@
   "content_scripts": [
     {
       "matches": ["<all_urls>"],
-      "js": [
-        "content_scripts/scriptlet_injector.js"
-      ],
+      "js": ["content_scripts/scriptlet_injector.js"],
       "run_at": "document_start",
       "all_frames": false
     },
@@ -43,40 +42,35 @@
     },
     {
       "matches": ["<all_urls>"],
-      "js": [
-        "content_scripts/social_blocker.js"
-      ],
+      "js": ["content_scripts/social_blocker.js"],
       "run_at": "document_idle",
       "all_frames": false
     },
     {
       "matches": ["*://*.youtube.com/*"],
-      "js": [
-        "content_scripts/youtube_skipper.js"
-      ],
+      "js": ["content_scripts/youtube_skipper.js"],
       "run_at": "document_start",
       "all_frames": false
     }
   ],
   "permissions": [
-    "webRequest",
     "declarativeNetRequest",
     "declarativeNetRequestWithHostAccess",
     "declarativeNetRequestFeedback",
+    "webRequest",
     "storage",
     "tabs",
     "activeTab",
     "scripting",
     "webNavigation",
-    "alarms",
-    "notifications"
+    "alarms"
   ],
   "host_permissions": ["<all_urls>"],
   "declarative_net_request": {
     "rule_resources": []
   },
   "content_security_policy": {
-    "extension_pages": "script-src 'self'; object-src 'none'; connect-src http://127.0.0.1:8765;"
+    "extension_pages": "script-src 'self'; object-src 'none'; connect-src http://127.0.0.1:8765 https://cloudflare-dns.com;"
   },
   "web_accessible_resources": [
     {
